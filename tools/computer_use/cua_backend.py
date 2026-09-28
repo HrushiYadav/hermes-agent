@@ -153,17 +153,19 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
 def sandbox_mcp_invocation() -> Optional[Tuple[Tuple[str, List[str]], Dict[str, str]]]:
     """``((command, args), child_env)`` spawning ``cua-driver mcp`` INSIDE the terminal backend when the Bot
     Desktop is placed there (the driver in the sandbox image drives the sandbox's own screen); None on a
-    gateway-hosted desktop, where the local driver is used."""
-    from tools.bot_desktop import runtime as _bd_runtime
-    if not _bd_runtime.sandbox_screen_running():
+    gateway-hosted desktop, where the local driver is used. Placement is the authority: a ``terminal``
+    placement gets its screen started here and a ``refused`` one raises — the host driver is never the
+    fallback for a sandbox whose screen is down."""
+    from tools.bot_desktop import placement, runtime as _bd_runtime
+    if _bd_runtime.tool_placement() == placement.GATEWAY:
         return None
     published = _bd_runtime.published_env()
     if not published.get("DISPLAY"):
-        return None
+        raise RuntimeError("the screen inside the terminal backend's sandbox is gone; start it again")
     from tools.bot_desktop import sandbox_host
-    env = _bd_runtime._sandbox_env(create=False)
+    env = _bd_runtime._sandbox_env(create=True)
     if env is None:
-        return None
+        raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run cua-driver")
     command, args = sandbox_host.cua_mcp_invocation(env, _bd_runtime._profile_name(),
                                                     {**published, _CUA_TELEMETRY_ENV_VAR: "0"})
     _bd_runtime.touch_activity()

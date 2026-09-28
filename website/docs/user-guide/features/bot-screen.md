@@ -239,7 +239,19 @@ same place. `bot_desktop.placement` decides where:
 
 `placement: gateway` forces the pre-existing behaviour (screen on the gateway
 host even with a sandboxed terminal) as an explicit opt-in; `placement:
-terminal` forces the sandbox and errors when it cannot host one.
+terminal` forces the sandbox and errors when it cannot host one (with a
+`local` backend the terminal *is* the gateway host, so it resolves there).
+
+Placement is policy, not a snapshot of what happens to be running. When the
+screen is placed in the sandbox, the first browser or `computer_use` call
+brings it up there on demand (no `auto_start` opt-in needed: the sandbox is
+the boundary you chose, and a screen inside it touches nothing outside it),
+and when it cannot come up the call fails with the reason. The host is never
+the fallback for a sandbox whose screen is down. A gateway restart does not
+lose the screen either: the host-side marker records which container owns
+it, so the restarted gateway re-attaches to a still-running sandbox, and
+`Stop` takes down the screen where it actually runs even if you changed
+`placement` in the meantime.
 
 ### The sandbox image
 
@@ -270,7 +282,9 @@ with **Switch image** / **Keep current image**; `hermes config set
 terminal.docker_image nousresearch/hermes-sandbox:desktop` is the same answer
 from any shell. Either answer writes `terminal.docker_image`, and a written
 image is a decision: the container is recreated on the next terminal call only
-when you chose the new image. What a switch means: files under `/root` and
+when you chose the new image, and only once the new image has been pulled (a
+private or misspelled tag, or a registry outage, keeps your current container
+running instead of leaving you with nothing). What a switch means: files under `/root` and
 `/workspace` stay (they are host directories under `~/.hermes/sandboxes/`),
 packages installed inside the container with `apt`/`pip`/`npm -g` are
 reinstalled on demand, and Python 3.11 virtualenvs need a rebuild on 3.13.
@@ -283,10 +297,19 @@ Chromium gets `--no-sandbox` inside containers (Docker's seccomp profile
 denies the user namespaces its own sandbox needs; the container is the
 sandbox).
 
-State inside the sandbox lives under `<sandbox tmp>/hermes-bot-desktop/<profile>/`
-(the sandbox's own temp dir, not the host's); the host keeps only a marker under
-`<HERMES_HOME>/bot-desktop/`. Screenshots the browser tools take are copied
-back to the host so `MEDIA:` paths keep working.
+Runtime state inside the sandbox (X socket, cookie, launcher log) lives under
+`<sandbox tmp>/hermes-bot-desktop/<profile>/`; the host keeps only a marker under
+`<HERMES_HOME>/bot-desktop/`. The browser profile (logins, cookies) lives in the
+desktop user's home inside the sandbox, `~/.hermes/bot-desktop/browser-profile`,
+shared by the agent's browser and the dock's **Browser** icon. It follows the
+container's own persistence: kept across stops and restarts of a persisted
+container, gone with an ephemeral one or when you approve an image switch (the
+container's writable layer is what a switch replaces). It is deliberately not
+under `/tmp`, which Docker mounts as a small tmpfs that is emptied on every stop.
+Screenshots the browser tools take are copied back to the host so `MEDIA:`
+paths keep working, the pane's thumbnail is grabbed inside the sandbox, and
+`browser_exec` / the vault autofill reach the sandbox's Chromium through a port
+forwarded over the same `docker exec` / `ssh` channel.
 
 ## Configuration
 

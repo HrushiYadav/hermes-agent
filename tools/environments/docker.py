@@ -263,7 +263,14 @@ _BASE_SECURITY_ARGS = [
     "--tmpfs", "/tmp:rw,nosuid,size=512m",  # no-tmp: ok — container tmpfs mount spec
     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m"]
 
-_DEFAULT_PIDS_LIMIT = "256"  # applied only when the pids cgroup controller is available
+# Fork-bomb guard, applied only when the pids cgroup controller is available. The pids cgroup counts
+# THREADS, and a sandbox that hosts the Bot Screen runs a desktop in here: measured on
+# hermes-sandbox:desktop, the idle container is 2 tasks, Xvnc + Xfce + dbus 44, one Chromium with one
+# tab 212, plus the agent's own agent-browser Chromium with two tabs 488. The old 256 was hit in normal
+# use and every further `docker exec` (browser command, cua-driver, thumbnail, CDP forward) died with
+# runc's "procReady not received". 2048 leaves room for a working browser and is still three orders of
+# magnitude under the host's pid_max.
+_DEFAULT_PIDS_LIMIT = "2048"
 
 # Docker's 64 MB /dev/shm default crashes Chromium/Playwright tabs and PyTorch
 # DataLoader workers. tmpfs is lazily allocated so a 1g ceiling costs nothing
@@ -859,6 +866,15 @@ class DockerEnvironment(BaseEnvironment):
                     "terminal.docker_image %s` (files in /root and /workspace carry over) or pin the "
                     "current image to stop this notice (task=%s, profile=%s).",
                     container_id[:12], actual_image, self._image, self._image, task_label, profile_name)
+            elif not self._image_available_locally():
+                # The replacement image cannot be had (private/misspelled tag, registry down, pull past
+                # its timeout). Removing the old container first would throw away its writable layer with
+                # nothing to put in its place, so keep running the sandbox the user has and retry the
+                # switch next time the image resolves.
+                logger.warning(
+                    "Existing container %s runs image %s; docker_image is %s but that image could not be "
+                    "pulled — keeping the current sandbox until it can (task=%s, profile=%s).",
+                    container_id[:12], actual_image, self._image, task_label, profile_name)
             else:
                 logger.warning(
                     "Existing container %s runs image %s but docker_image is %s — removing it and "
@@ -896,6 +912,20 @@ class DockerEnvironment(BaseEnvironment):
             "Reusing container %s (task=%s, profile=%s, prior state=%s)",
             container_id[:12], task_label, profile_name, state)
         return True
+
+    def _image_available_locally(self) -> bool:
+        """True once ``self._image`` is in the local image store, pulling it when it is not. Called BEFORE a
+        container replacement removes anything: a pull that fails must leave the old sandbox intact."""
+        try:
+            probe = run_capture([self._docker_exe, "image", "inspect", self._image, "--format", "{{.Id}}"],
+                                timeout=30)
+            if probe.returncode == 0:
+                return True
+            pull = run_capture([self._docker_exe, "pull", self._image], timeout=900)
+            return pull.returncode == 0
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.warning("Docker: could not pull %s: %s", self._image, e)
+            return False
 
     def _start_container(self, container_id: str) -> Exception | None:
         """``docker start`` a stopped container; returns the failure instead of raising."""

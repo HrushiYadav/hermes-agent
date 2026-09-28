@@ -357,12 +357,25 @@ def desktop_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 
 
 def ensure_started_for_tool() -> None:
-    """Tool-boundary hook (``computer_use`` dispatch and the headed Chromium spawn sites of the browser tool): with
-    ``bot_desktop.auto_start`` (opt-in, default off) a Linux host that has NO display and the packages installed gets
-    its screen started on first use, so a headless gateway works the first time instead of answering "no DISPLAY is
-    set". Failure is not an error here; the tool's own "no display" diagnosis is the right message then."""
-    if published_env():
+    """Tool-boundary hook (``computer_use`` dispatch and the headed Chromium spawn sites of the browser tool).
+
+    Under ``terminal`` placement the sandbox screen is brought up on first use unconditionally: the sandbox is
+    the boundary the user chose, a screen inside it touches nothing outside it, and the tools below refuse
+    rather than run on the host when it is not up. On the gateway host, ``bot_desktop.auto_start`` (opt-in,
+    default off) starts a Linux host's screen when it has NO display and the packages installed, so a headless
+    gateway works the first time. Host failure is not an error here (the tool's own "no display" diagnosis is
+    the right message then); a sandbox start failure is logged and left for :func:`tool_placement` to raise."""
+    if published_env().get("DISPLAY"):
         touch_activity()
+        return
+    where = placement.resolve()
+    if where.where == placement.REFUSED:
+        return  # tool_placement() raises the reason at the spawn site
+    if where.where == placement.TERMINAL:
+        try:
+            start()
+        except Exception as exc:
+            logger.info("Bot Desktop sandbox start deferred to the tool: %s", exc)
         return
     if not _should_auto_start(os.environ):
         return
@@ -370,6 +383,22 @@ def ensure_started_for_tool() -> None:
         start()
     except Exception as exc:
         logger.info("Bot Desktop auto-start skipped: %s", exc)
+
+
+def tool_placement() -> str:
+    """Where the browser / cua-driver a tool is about to spawn MUST run: ``placement.GATEWAY`` or
+    ``placement.TERMINAL``. Policy first, liveness second: a ``terminal`` placement whose screen is down gets
+    it started here (raising with the blocker when it cannot come up) and a ``refused`` placement raises its
+    reason. Neither ever yields the host — a screen that happens to be down is not permission to run the
+    agent's browser outside the sandbox the user chose."""
+    where = placement.resolve()
+    if where.where == placement.REFUSED:
+        raise RuntimeError(where.reason)
+    if where.where == placement.GATEWAY:
+        return placement.GATEWAY
+    if not sandbox_screen_running() or not published_env().get("DISPLAY"):
+        start()
+    return placement.TERMINAL
 
 
 def _should_auto_start(env: Dict[str, str]) -> bool:
@@ -474,18 +503,38 @@ def in_sandbox() -> bool:
 
 
 def sandbox_screen_running() -> bool:
-    """True when a sandbox-hosted screen is UP for this profile: the start marker exists AND the terminal
-    environment it was started in is still registered in this process. No config read, no docker call,
-    so the browser and CUA can ask on every command. A marker whose sandbox is gone is stale (the
-    container was removed out from under us): drop it, so the next start rebuilds rather than the
-    browser exec-ing into a dead container."""
+    """True when a sandbox-hosted screen is UP for this profile: the start marker exists AND the sandbox it
+    names is alive — registered in this process, or (after a gateway restart emptied the registry) the
+    marker's recorded container still running. Only a sandbox that is provably gone (its container removed
+    out from under us) drops the marker, so the next start rebuilds instead of the browser exec-ing into a
+    dead container; an unregistered-but-alive one is re-attached by ``_sandbox_env(create=True)`` at the
+    next spawn (the terminal planner reuses the persisted container by label)."""
     from tools.bot_desktop import sandbox_host
-    if not sandbox_host._read_marker():
+    marker = sandbox_host._read_marker()
+    if not marker:
         return False
-    if _sandbox_env(create=False) is None:
-        sandbox_host._marker().unlink(missing_ok=True)
-        return False
-    return True
+    if _sandbox_env(create=False) is not None:
+        return True
+    if sandbox_host.marker_sandbox_alive(marker):
+        return True
+    sandbox_host._marker().unlink(missing_ok=True)
+    return False
+
+
+def _owned_sandbox_env():
+    """The environment hosting the screen the marker records, re-attaching after a restart when the recorded
+    sandbox is still alive; None when there is no marker or its sandbox is gone. Never builds a sandbox for
+    a screen that is not there."""
+    from tools.bot_desktop import sandbox_host
+    marker = sandbox_host._read_marker()
+    if not marker:
+        return None
+    env = _sandbox_env(create=False)
+    if env is not None:
+        return env
+    if sandbox_host.marker_sandbox_alive(marker):
+        return _sandbox_env(create=True)
+    return None
 
 
 def is_running() -> bool:
@@ -510,8 +559,11 @@ def geometry() -> str:
 def status(profile: Optional[str] = None) -> DesktopStatus:
     from tools.bot_desktop import browser as _bd_browser
     from tools.bot_desktop import resources
+    from tools.bot_desktop import sandbox_host
     where = placement.resolve()
-    if where.where == placement.TERMINAL:
+    if where.where == placement.TERMINAL or sandbox_host._read_marker():
+        # A screen already running inside a sandbox is reported (and stoppable) even after the placement
+        # setting moved: the recorded owner wins over the current policy until it is stopped.
         return _sandbox_status(profile, where)
     missing: list[str] = missing_binaries() if is_supported_host() else list(REQUIRED_BINARIES)
     pid = _launcher_pid()
@@ -541,7 +593,7 @@ def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
     """Status of a sandbox-placed screen. Package presence is only known once the sandbox exists; before
     that the pane shows "installed" with the image hint carried in ``install_command`` so Start can explain."""
     from tools.bot_desktop import sandbox_host
-    env = _sandbox_env(create=False)
+    env = _owned_sandbox_env() or _sandbox_env(create=False)
     missing = sandbox_host.missing_binaries(env) if env is not None else []
     published = sandbox_host.published_env(env, profile or _profile_name()) if env is not None else {}
     running = bool(published.get("DISPLAY"))
@@ -730,7 +782,13 @@ def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
     sd.mkdir(parents=True, exist_ok=True)
     os.chmod(sd, 0o700)
     with _flocked(sd / "start.lock"):
-        published = sandbox_host.start(env, _profile_name(), geometry=geometry(), wait_seconds=max(wait_seconds, 20.0))
+        # The dock's Browser icon runs the sandbox's own Playwright Chromium on the profile agent-browser
+        # uses there: the human's browser is the bot's browser, as on the host.
+        from tools.bot_desktop.browser import dock_exec_line
+        exe = sandbox_host.chromium_executable(env)
+        browser = (exe, dock_exec_line(exe, sandbox_host.browser_profile_dir(env), sandbox_bypass=True)) if exe else (None, None)
+        published = sandbox_host.start(env, _profile_name(), geometry=geometry(), wait_seconds=max(wait_seconds, 20.0),
+                                       browser_exec=browser[0], browser_exec_line=browser[1])
     (sd / "env").write_text("".join(f"{k}={v}\n" for k, v in published.items()), encoding="utf-8")
     touch_activity()
     return status()
@@ -748,10 +806,13 @@ def _sandbox_published_env() -> Dict[str, str]:
 def stop() -> bool:
     """Stop this profile's desktop; True when a running launcher (or the X server a dead one left behind)
     was signalled."""
-    if placement.resolve().where == placement.TERMINAL:
-        from tools.bot_desktop import sandbox_host
-        env = _sandbox_env(create=False)
+    from tools.bot_desktop import sandbox_host
+    if sandbox_host._read_marker() or placement.resolve().where == placement.TERMINAL:
+        # The marker names the sandbox that owns the screen; stop THAT one (re-attaching after a restart),
+        # whatever the placement setting says now. A marker whose sandbox is gone is simply dropped.
+        env = _owned_sandbox_env()
         stopped = sandbox_host.stop(env, _profile_name()) if env is not None else False
+        sandbox_host._marker().unlink(missing_ok=True)
         for name in ("env", "activity"):
             (state_dir() / name).unlink(missing_ok=True)
         return stopped

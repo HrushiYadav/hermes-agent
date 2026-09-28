@@ -63,8 +63,116 @@ def _read_marker() -> Dict[str, Any]:
         return {}
 
 
+def _owner_identity(env: Any) -> Dict[str, Any]:
+    """What the marker records about the sandbox hosting the screen, so a restarted gateway (empty terminal
+    registry) can tell a still-running sandbox from one that was removed."""
+    ident: Dict[str, Any] = {"backend": type(env).__name__}
+    container = getattr(env, "_container_id", None)
+    if container:
+        ident["container"] = container
+        ident["docker"] = getattr(env, "_docker_exe", "docker")
+    return ident
+
+
+_ALIVE_CACHE: Dict[str, tuple[float, bool]] = {}
+
+
+def marker_sandbox_alive(marker: Dict[str, Any]) -> bool:
+    """Whether the sandbox a marker names still exists. Docker: ``docker inspect`` on the recorded container
+    (cached a few seconds; this sits on the browser's per-command path). Other backends (ssh host, apptainer
+    instance) cannot be probed from here without their environment object: the re-attach's own
+    ``published_env`` probe decides, so they read as alive."""
+    container = marker.get("container")
+    if not container:
+        return True
+    now = time.monotonic()
+    cached = _ALIVE_CACHE.get(container)
+    if cached and now - cached[0] < 5.0:
+        return cached[1]
+    try:
+        proc = subprocess.run([marker.get("docker") or "docker", "inspect", "-f", "{{.State.Running}}", container],
+                              capture_output=True, text=True, timeout=15, check=False)
+        alive = proc.returncode == 0 and proc.stdout.strip() == "true"
+    except (OSError, subprocess.TimeoutExpired):
+        alive = False
+    _ALIVE_CACHE[container] = (now, alive)
+    return alive
+
+
 def _remote_dir(env: Any, profile: str) -> str:
     return f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/{profile}"
+
+
+def desktop_home(env: Any) -> str:
+    """``$HOME`` of the user the desktop and the browser run as inside ``env`` (cached on the env). This
+    is where state that must outlive a container stop goes: ``/tmp`` in the Docker backend is a 512 MB
+    tmpfs that is emptied on every stop and shared with the sandbox's scratch, so a browser profile
+    (logins, cookies) there would vanish and grow into that cap."""
+    cached = getattr(env, "_bd_desktop_home", None)
+    if cached:
+        return cached
+    proc = streams.run_in(env, ["bash", "-c", 'printf %s "$HOME"'], user=_user_for(env), timeout=15)
+    home = proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
+    if not home or not home.startswith("/"):
+        home = f"/home/{DESKTOP_USER}" if _user_for(env) else "/root"
+    env._bd_desktop_home = home
+    return home
+
+
+def browser_profile_dir(env: Any) -> str:
+    """The ONE ``--user-data-dir`` the agent's agent-browser and the dock's Browser icon share inside the
+    sandbox (same rule as the host: two profiles would mean the human logs into a jar the bot never sees)."""
+    return f"{desktop_home(env).rstrip('/')}/.hermes/bot-desktop/browser-profile"
+
+
+_CHROMIUM_PROBE = (
+    'for d in "${PLAYWRIGHT_BROWSERS_PATH:-}" /opt/playwright "$HOME/.cache/ms-playwright"; do'
+    ' [ -n "$d" ] || continue;'
+    ' for c in "$d"/chromium-*/chrome-linux/chrome "$d"/chromium-*/chrome-linux64/chrome; do'
+    ' [ -x "$c" ] && { printf %s "$c"; exit 0; }; done; done; exit 1'
+)
+
+
+def chromium_executable(env: Any) -> Optional[str]:
+    """Path of the Playwright Chromium agent-browser uses inside ``env`` (the dock's Browser icon must run
+    the same binary), or None when the image has none. Cached on the env."""
+    cached = getattr(env, "_bd_chromium", "unset")
+    if cached != "unset":
+        return cached
+    proc = streams.run_in(env, ["bash", "-c", _CHROMIUM_PROBE], user=_user_for(env), timeout=20)
+    exe = proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
+    env._bd_chromium = exe or None
+    return env._bd_chromium
+
+
+_GRAB_SCRIPT = """
+import io, sys
+from PIL import ImageGrab
+img = ImageGrab.grab(xdisplay=sys.argv[1])
+img.thumbnail((int(sys.argv[2]), int(sys.argv[3])))
+buf = io.BytesIO()
+img.convert("RGB").save(buf, "JPEG", quality=int(sys.argv[4]), optimize=True)
+sys.stdout.buffer.write(buf.getvalue())
+"""
+
+
+def grab_jpeg(env: Any, published: Dict[str, str], max_size: tuple[int, int], quality: int) -> Optional[bytes]:
+    """One JPEG of the sandbox screen, grabbed INSIDE the sandbox (the X socket and its cookie live there).
+    Needs Pillow in the image (the published desktop image ships it); None when the grab fails."""
+    display = published.get("DISPLAY")
+    if not display:
+        return None
+    child_env = {k: v for k, v in published.items() if k in ("DISPLAY", "XAUTHORITY")}
+    try:
+        proc = streams.run_in(env, ["python3", "-c", _GRAB_SCRIPT, display, str(max_size[0]), str(max_size[1]),
+                                    str(quality)], child_env=child_env, user=_user_for(env), timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("sandbox screen grab failed: %s", exc)
+        return None
+    if proc.returncode != 0 or not proc.stdout.startswith(b"\xff\xd8"):
+        logger.debug("sandbox screen grab failed: %s", proc.stderr.decode("utf-8", "replace")[-300:])
+        return None
+    return proc.stdout
 
 
 def _user_for(env: Any) -> Optional[str]:
@@ -152,7 +260,8 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
         live = _published(env, rdir)
         if live.get("DISPLAY"):
             _marker().parent.mkdir(parents=True, exist_ok=True)
-            _marker().write_text(json.dumps({"display": live["DISPLAY"], "dir": rdir, "profile": profile}), encoding="utf-8")
+            _marker().write_text(json.dumps({"display": live["DISPLAY"], "dir": rdir, "profile": profile,
+                                             **_owner_identity(env)}), encoding="utf-8")
             logger.info("Bot Desktop for profile %s up inside %s on %s", profile, type(env).__name__, live["DISPLAY"])
             return live
         time.sleep(0.25)
@@ -192,13 +301,8 @@ def open_rfb_stream(env: Any, profile: str) -> subprocess.Popen:
 def cua_mcp_invocation(env: Any, profile: str, published: Dict[str, str]) -> tuple[str, list[str]]:
     """``(command, args)`` for ``StdioServerParameters``: the backend's exec prefix running ``cua-driver mcp`` on
     the sandbox display."""
-    prefix = streams.exec_prefix(env, user=_user_for(env), interactive=True)
-    if prefix is None:
+    argv = streams.remote_command(env, ["cua-driver", "mcp", "--no-overlay"], child_env=published,
+                                  user=_user_for(env), interactive=True)
+    if argv is None:
         raise RuntimeError(f"{type(env).__name__} cannot host cua-driver")
-    argv = streams.remote_argv(prefix, ["cua-driver", "mcp", "--no-overlay"], env=published)
     return argv[0], argv[1:]
-
-
-def exec_prefix_for_tools(env: Any) -> Optional[list[str]]:
-    """The prefix agent-browser invocations are wrapped in when the browser follows the terminal backend."""
-    return streams.exec_prefix(env, user=_user_for(env), interactive=True)

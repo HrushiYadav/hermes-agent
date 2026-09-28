@@ -632,10 +632,12 @@ _SANDBOX_ENV_KEYS = ("AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_IDLE_TIMEOUT_MS"
 
 
 def _browser_in_sandbox() -> bool:
-    """The bot's browser runs INSIDE the terminal backend when its screen is placed there: same Chromium a
-    human takes over in the pane, same profile, and the host is never touched by a page the model chose."""
-    from tools.bot_desktop import runtime as _bd_runtime
-    return _bd_runtime.sandbox_screen_running()
+    """The bot's browser runs INSIDE the terminal backend when its screen is PLACED there (policy, not
+    liveness: same Chromium a human takes over in the pane, same profile, and the host is never touched by a
+    page the model chose — whether or not the screen happens to be up right now). ``_browser_command_preflight``
+    is where the screen is brought up or the command refused."""
+    from tools.bot_desktop import placement
+    return placement.resolve().where == placement.TERMINAL
 
 
 def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str) -> "tuple[List[str], Dict[str, str]]":
@@ -649,7 +651,6 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     env = _bd_runtime._sandbox_env(create=True)
     if env is None:
         raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run the browser")
-    _bd_runtime.ensure_started_for_tool()
     published = _bd_runtime.published_env()
     if not published.get("DISPLAY"):
         # The sandbox died under a live screen (container removed, ssh host rebooted). Fail here rather than
@@ -659,19 +660,19 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     remote_env.update(published)
     remote_env["AGENT_BROWSER_SOCKET_DIR"] = _sandbox_socket_dir(env)
     remote_env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)  # the sandbox image's Playwright Chromium, not a host path
-    remote_env["AGENT_BROWSER_PROFILE"] = f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/browser-profile"
+    remote_env["AGENT_BROWSER_PROFILE"] = sandbox_host.browser_profile_dir(env)  # persists with the container, not its tmpfs
     remote_env["TMPDIR"] = env.get_temp_dir()
     if not getattr(env, "_bd_browser_dirs_ready", False):
         streams.run_in(env, ["mkdir", "-p", _sandbox_socket_dir(env), f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/shots",
                              remote_env["AGENT_BROWSER_PROFILE"]], user=sandbox_host._user_for(env), timeout=15)
         env._bd_browser_dirs_ready = True
     remote_env["AGENT_BROWSER_ARGS"] = ",".join(CHROMIUM_SANDBOX_BYPASS_ARGS)  # container: no userns for Chromium's own sandbox
-    prefix = sandbox_host.exec_prefix_for_tools(env)
-    if prefix is None:
-        raise RuntimeError(f"{type(env).__name__} cannot host the browser")
     # cmd_parts = <agent-browser argv0 (+npx spec)> + backend args + command; keep everything after argv0.
     tail = cmd_parts[len(_agent_browser_argv(cmd_parts[0])):]
-    wrapped = streams.remote_argv(prefix, [_SANDBOX_AGENT_BROWSER, *tail], env=remote_env)
+    wrapped = streams.remote_command(env, [_SANDBOX_AGENT_BROWSER, *tail], child_env=remote_env,
+                                     user=sandbox_host._user_for(env), interactive=True)
+    if wrapped is None:
+        raise RuntimeError(f"{type(env).__name__} cannot host the browser")
     host_env = {"PATH": browser_env.get("PATH", os.environ.get("PATH", "")), "HOME": os.environ.get("HOME", "")}
     return wrapped, host_env
 
@@ -679,7 +680,12 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
 def _browser_command_preflight() -> Dict[str, Any]:
     """Fail fast before spawning (missing CLI, Termux gap, interrupt, no Chromium in local
     mode — else every call hangs for command_timeout). Error result, or ``{"browser_cmd": path}``."""
-    if _browser_in_sandbox():
+    from tools.bot_desktop import placement, runtime as _bd_runtime
+    try:
+        where = _bd_runtime.tool_placement()  # starts the sandbox screen on demand; raises for refused / down
+    except RuntimeError as e:
+        return {"success": False, "error": f"The browser cannot run here: {e}"}
+    if where == placement.TERMINAL:
         from tools.interrupt import is_interrupted
         if is_interrupted():
             return {"success": False, "error": "Interrupted"}

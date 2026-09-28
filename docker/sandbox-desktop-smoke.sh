@@ -29,6 +29,7 @@ docker exec -u pn "$NAME" bash -c '
   cua-driver --version
   agent-browser --version
   ls /opt/playwright/chromium-*/chrome-linux*/chrome >/dev/null || { echo "missing headed chromium"; exit 1; }
+  python3 -c "from PIL import ImageGrab"  # the Screen pane thumbnail is grabbed inside the sandbox
   sudo -n true
   [ "$(id -u)" = 1000 ]'
 

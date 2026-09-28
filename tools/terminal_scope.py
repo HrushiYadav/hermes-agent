@@ -132,14 +132,21 @@ def build_profile_terminal_scope(
             raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
         from agent.secret_scope import load_env_file
 
-        scope.update((k, str(v)) for k, v in load_env_file(env_path).items()
-                     if k.startswith("TERMINAL_"))
+        profile_env = load_env_file(env_path)
+        scope.update((k, str(v)) for k, v in profile_env.items() if k.startswith("TERMINAL_"))
+        # Provenance, not value: an image WRITTEN in the profile's .env is the user's choice even when
+        # it spells the default (same rule apply_terminal_config_to_env applies to a set env var).
+        image_pinned = "TERMINAL_DOCKER_IMAGE" in profile_env
+    else:
+        image_pinned = False
     if env_overlay:
         scope.update((k, str(v)) for k, v in env_overlay.items()
                      if k.startswith("TERMINAL_") and k != "TERMINAL_DOCKER_IMAGE_PINNED")
-    # Same verdict as apply_terminal_config_to_env: pinned when the profile's .env / launch overlay
-    # / config.yaml chose the image, default otherwise (recomputed here, never inherited).
-    image_pinned = scope.get("TERMINAL_DOCKER_IMAGE") != default_image
+        # The overlay is the LAUNCHER's environment: its pin verdict is about the launcher's profile and
+        # is never inherited, and the bridge backfills TERMINAL_DOCKER_IMAGE for defaults too, so only a
+        # value that differs from the default can prove a choice made there.
+        if env_overlay.get("TERMINAL_DOCKER_IMAGE") not in (None, default_image):
+            image_pinned = True
     # Read config.yaml directly, not via read_raw_config() (which collapses "missing" and
     # "unparseable" into {}): present-but-unparseable must fail closed.
     config_path = home / "config.yaml"

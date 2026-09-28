@@ -48,12 +48,13 @@ def _terminal_backend() -> str:
 
 
 def resolve() -> Placement:
-    setting, backend = _setting(), _terminal_backend()
-    if setting == GATEWAY:
-        return Placement(GATEWAY, backend)
+    # Backend first (env only): a local terminal IS the gateway host whatever the setting says, and that is
+    # the common case — it must not cost a config load (this runs on every browser / cua-driver spawn).
+    backend = _terminal_backend()
     if backend == "local":
-        if setting == TERMINAL:
-            return Placement(GATEWAY, backend, "terminal.backend is local, so the terminal IS the gateway host")
+        return Placement(GATEWAY, backend, "terminal.backend is local, so the terminal IS the gateway host")
+    setting = _setting()
+    if setting == GATEWAY:
         return Placement(GATEWAY, backend)
     if backend in _STREAM_BACKENDS:
         return Placement(TERMINAL, backend)

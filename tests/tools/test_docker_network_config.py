@@ -64,7 +64,7 @@ def test_every_sandbox_creator_passes_the_full_container_config(monkeypatch):
 
 def _reuse_guard_harness(
     monkeypatch, *, existing_mode: str, network: bool, extra_args=None, existing_image: str = "python:3.11",
-    image_pinned: bool = False,
+    image_pinned: bool = False, image_pullable: bool = True,
 ):
     """Drive DockerEnvironment through the cross-process reuse path with a
     fake existing container whose NetworkMode is *existing_mode*.
@@ -89,6 +89,11 @@ def _reuse_guard_harness(
         elif len(cmd) > 1 and cmd[1] == "inspect":
             # Two probes share `inspect`: image identity (must match for reuse) and network mode.
             Result.stdout = f"{existing_image}\n" if ".Config.Image" in cmd[3] else f"{existing_mode}\n"
+        elif len(cmd) > 2 and cmd[1:3] == ["image", "inspect"]:
+            Result.returncode = 1  # never in the local store: the replacement must go through `pull`
+        elif len(cmd) > 1 and cmd[1] == "pull":
+            Result.returncode = 0 if image_pullable else 1
+            Result.stderr = "" if image_pullable else "pull access denied"
         elif len(cmd) > 1 and cmd[1] == "run":
             Result.stdout = "fresh-container-id\n"
         return Result()
@@ -145,6 +150,28 @@ def test_reuse_recreates_container_built_from_another_image_when_pinned(monkeypa
 
     assert any(cmd[1:3] == ["rm", "-f"] for cmd in commands), "container from another image must be removed"
     assert any(len(cmd) > 2 and cmd[1:3] == ["run", "-d"] for cmd in commands)
+
+
+def test_reuse_pulls_the_replacement_before_removing_the_old_container(monkeypatch):
+    """The old container's writable layer is the user's sandbox; it goes only once the image replacing it
+    is in the local store, so a private/misspelled tag or a registry outage never leaves them with
+    nothing."""
+    commands = _reuse_guard_harness(monkeypatch, existing_mode="bridge", network=True,
+                                    existing_image="old/image:1", image_pinned=True)
+    kinds = [tuple(c[1:3]) for c in commands]
+    assert kinds.index(("pull", "python:3.11")) < kinds.index(("rm", "-f"))
+
+
+def test_reuse_keeps_the_old_container_when_the_replacement_cannot_be_pulled(monkeypatch, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger=docker_env.logger.name):
+        commands = _reuse_guard_harness(monkeypatch, existing_mode="bridge", network=True,
+                                        existing_image="old/image:1", image_pinned=True, image_pullable=False)
+
+    assert any(cmd[1] == "pull" for cmd in commands)
+    assert not any(cmd[1:3] == ["rm", "-f"] for cmd in commands), "nothing to replace it with: keep the sandbox"
+    assert not any(len(cmd) > 2 and cmd[1:3] == ["run", "-d"] for cmd in commands)
+    assert "could not be pulled" in caplog.text and "keeping the current sandbox" in caplog.text
 
 
 def test_reuse_keeps_container_built_from_another_image_when_default_flipped(monkeypatch, caplog):

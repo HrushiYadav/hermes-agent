@@ -70,6 +70,10 @@ RUN set -eu; \
     ln -sf /opt/cua-driver/cua-driver /usr/local/bin/cua-driver; \
     /usr/local/bin/cua-driver --version
 
+# Pillow: the Screen pane's thumbnail is grabbed INSIDE the sandbox (the X socket and its cookie live
+# here, not on the gateway host). Also used by the base for ad-hoc image work.
+RUN pip install --no-cache-dir "pillow>=10" && python3 -c "from PIL import ImageGrab"
+
 # The base's default user stays root, exactly like nikolaik today, so existing
 # docker_image users see no ownership or PATH change. Desktop processes (Xvnc,
 # Xfce, Chromium, cua-driver) are exec'd as the base's unprivileged `pn` (uid

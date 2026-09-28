@@ -86,6 +86,23 @@ def test_terminal_scope_recomputes_the_pin_per_profile(home, tmp_path):
 
 # ── the switch module against a fake docker ─────────────────────────────────────────────────────
 
+def test_terminal_scope_pins_an_image_written_in_the_profile_env_even_when_it_spells_the_default(home):
+    """Provenance, not value: the approval writes the default's exact tag, and a profile whose .env carries
+    TERMINAL_DOCKER_IMAGE chose it. The scope must agree with the bridge's verdict for the same input."""
+    from tools.terminal_scope import build_profile_terminal_scope
+    from hermes_cli.config_defaults import DEFAULT_SANDBOX_IMAGE
+
+    _write(home, {"backend": "docker"})
+    (home / ".env").write_text(f"TERMINAL_DOCKER_IMAGE={DEFAULT_SANDBOX_IMAGE}\n", encoding="utf-8")
+    scope = build_profile_terminal_scope(home)
+    assert scope["TERMINAL_DOCKER_IMAGE"] == DEFAULT_SANDBOX_IMAGE
+    assert scope["TERMINAL_DOCKER_IMAGE_PINNED"] == "1"
+
+    (home / ".env").write_text("TERMINAL_DOCKER_IMAGE=ghcr.io/me/mine:1\n", encoding="utf-8")
+    assert build_profile_terminal_scope(home)["TERMINAL_DOCKER_IMAGE_PINNED"] == "1"
+    (home / ".env").write_text("OTHER=1\n", encoding="utf-8")
+    assert build_profile_terminal_scope(home)["TERMINAL_DOCKER_IMAGE_PINNED"] == "0"
+
 def _fake_docker(tmp_path, monkeypatch, ps_output: str) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
