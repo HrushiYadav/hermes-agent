@@ -45,11 +45,16 @@ RUN apt-get -o Acquire::Retries=3 update && \
 
 # Headed Chromium through Playwright (the same build the Hermes -desktop image
 # uses), so agent-browser and the dock's Browser icon share one binary and one
-# --user-data-dir. --with-deps pulls the Chromium runtime libraries.
+# --user-data-dir. --with-deps pulls the Chromium runtime libraries. agent-browser
+# itself is baked (the CLI the browser tools drive), pinned to the same range the
+# gateway resolves (tools/browser_tool.py AGENT_BROWSER_NPX_SPEC), scripts off:
+# the first browser_navigate in a fresh sandbox must not wait on an npm fetch.
 RUN for i in 1 2 3; do \
         npx --yes playwright@1 install --with-deps chromium && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright chromium install failed (attempt $i); retrying in 10s"; sleep 10; }; \
-    done && chmod -R a+rX /opt/playwright
+    done && chmod -R a+rX /opt/playwright && \
+    npm install -g --ignore-scripts --no-audit --fetch-retries=5 "agent-browser@^0.26.0" && \
+    agent-browser --version
 
 # cua-driver: computer_use's MCP driver. Pinned release tarball from the
 # cua-driver-rs-v* tags (never releases/latest: prereleases publish 0 assets).
@@ -64,6 +69,10 @@ RUN set -eu; \
         | tar -xz -C /opt/cua-driver; \
     ln -sf /opt/cua-driver/cua-driver /usr/local/bin/cua-driver; \
     /usr/local/bin/cua-driver --version
+
+# Pillow: the Screen pane's thumbnail is grabbed INSIDE the sandbox (the X socket and its cookie live
+# here, not on the gateway host). Also used by the base for ad-hoc image work.
+RUN pip install --no-cache-dir "pillow>=10" && python3 -c "from PIL import ImageGrab"
 
 # The base's default user stays root, exactly like nikolaik today, so existing
 # docker_image users see no ownership or PATH change. Desktop processes (Xvnc,
