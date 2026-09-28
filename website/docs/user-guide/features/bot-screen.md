@@ -305,7 +305,7 @@ shared by the agent's browser and the dock's **Browser** icon. It follows the
 container's own persistence: kept across stops and restarts of a persisted
 container, gone with an ephemeral one or when you approve an image switch (the
 container's writable layer is what a switch replaces). It is deliberately not
-under `/tmp`, which Docker mounts as a small tmpfs that is emptied on every stop.
+under the container's temp dir, which Docker mounts as a small tmpfs that is emptied on every stop.
 Screenshots the browser tools take are copied back to the host so `MEDIA:`
 paths keep working, the pane's thumbnail is grabbed inside the sandbox, and
 `browser_exec` / the vault autofill reach the sandbox's Chromium through a port
